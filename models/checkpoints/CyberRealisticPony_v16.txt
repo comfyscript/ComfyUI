@@ -1,0 +1,4 @@
+# This is to load source files
+
+Size => 6938040650
+Source => urn:air:sdxl:checkpoint:civitai:443821@2581228
