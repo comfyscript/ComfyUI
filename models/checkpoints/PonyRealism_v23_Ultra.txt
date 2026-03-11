@@ -1,0 +1,2 @@
+Size => 6938040706
+Source => urn:air:sdxl:checkpoint:civitai:372465@1920896
