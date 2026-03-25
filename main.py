@@ -3,14 +3,18 @@ comfy.options.enable_args_parsing()
 
 import os
 import importlib.util
+import shutil
+import importlib.metadata
 import folder_paths
 import time
 from comfy.cli_args import args, enables_dynamic_vram
 from app.logger import setup_logger
 from app.assets.seeder import asset_seeder
+from app.assets.services import register_output_files
 import itertools
 import utils.extra_config
 from utils.mime_types import init_mime_types
+import faulthandler
 import logging
 import sys
 from comfy_execution.progress import get_progress_state
@@ -24,6 +28,8 @@ if __name__ == "__main__":
     os.environ['DO_NOT_TRACK'] = '1'
 
 setup_logger(log_level=args.verbose, use_stdout=args.log_stdout)
+
+faulthandler.enable(file=sys.stderr, all_threads=False)
 
 import comfy_aimdo.control
 
@@ -64,8 +70,15 @@ if __name__ == "__main__":
 
 
 def handle_comfyui_manager_unavailable():
-    if not args.windows_standalone_build:
-        logging.warning(f"\n\nYou appear to be running comfyui-manager from source, this is not recommended. Please install comfyui-manager using the following command:\ncommand:\n\t{sys.executable} -m pip install --pre comfyui_manager\n")
+    manager_req_path = os.path.join(os.path.dirname(os.path.abspath(folder_paths.__file__)), "manager_requirements.txt")
+    uv_available = shutil.which("uv") is not None
+
+    pip_cmd = f"{sys.executable} -m pip install -r {manager_req_path}"
+    msg = f"\n\nTo use the `--enable-manager` feature, the `comfyui-manager` package must be installed first.\ncommand:\n\t{pip_cmd}"
+    if uv_available:
+        msg += f"\nor using uv:\n\tuv pip install -r {manager_req_path}"
+    msg += "\n"
+    logging.warning(msg)
     args.enable_manager = False
 
 
@@ -173,7 +186,6 @@ execute_prestartup_script()
 
 # Main code
 import asyncio
-import shutil
 import threading
 import gc
 
@@ -195,8 +207,8 @@ import hook_breaker_ac10a0
 import comfy.memory_management
 import comfy.model_patcher
 
-if enables_dynamic_vram() and comfy.model_management.is_nvidia() and not comfy.model_management.is_wsl():
-    if comfy.model_management.torch_version_numeric < (2, 8):
+if args.enable_dynamic_vram or (enables_dynamic_vram() and comfy.model_management.is_nvidia() and not comfy.model_management.is_wsl()):
+    if (not args.enable_dynamic_vram) and (comfy.model_management.torch_version_numeric < (2, 8)):
         logging.warning("Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
     elif comfy_aimdo.control.init_device(comfy.model_management.get_torch_device().index):
         if args.verbose == 'DEBUG':
@@ -227,6 +239,38 @@ def cuda_malloc_warning():
                 cuda_malloc_warning = True
         if cuda_malloc_warning:
             logging.warning("\nWARNING: this card most likely does not support cuda-malloc, if you get \"CUDA error\" please run ComfyUI with: --disable-cuda-malloc\n")
+
+
+def _collect_output_absolute_paths(history_result: dict) -> list[str]:
+    """Extract absolute file paths for output items from a history result."""
+    paths: list[str] = []
+    seen: set[str] = set()
+    for node_output in history_result.get("outputs", {}).values():
+        for items in node_output.values():
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type not in ("output", "temp"):
+                    continue
+                base_dir = folder_paths.get_directory_by_type(item_type)
+                if base_dir is None:
+                    continue
+                base_dir = os.path.abspath(base_dir)
+                filename = item.get("filename")
+                if not filename:
+                    continue
+                abs_path = os.path.abspath(
+                    os.path.join(base_dir, item.get("subfolder", ""), filename)
+                )
+                if not abs_path.startswith(base_dir + os.sep) and abs_path != base_dir:
+                    continue
+                if abs_path not in seen:
+                    seen.add(abs_path)
+                    paths.append(abs_path)
+    return paths
 
 
 def prompt_worker(q, server_instance):
@@ -263,6 +307,7 @@ def prompt_worker(q, server_instance):
 
             asset_seeder.pause()
             e.execute(item[2], prompt_id, extra_data, item[4])
+
             need_gc = True
 
             remove_sensitive = lambda prompt: prompt[:5] + prompt[6:]
@@ -285,6 +330,10 @@ def prompt_worker(q, server_instance):
             else:
                 logging.info("Prompt executed in {:.2f} seconds".format(execution_time))
 
+            if not asset_seeder.is_disabled():
+                paths = _collect_output_absolute_paths(e.history_result)
+                register_output_files(paths, job_id=prompt_id)
+
         flags = q.get_flags()
         free_memory = flags.get("free_memory", False)
 
@@ -306,6 +355,9 @@ def prompt_worker(q, server_instance):
                 last_gc_collect = current_time
                 need_gc = False
                 hook_breaker_ac10a0.restore_functions()
+
+                if not asset_seeder.is_disabled():
+                    asset_seeder.enqueue_enrich(roots=("output",), compute_hashes=True)
                 asset_seeder.resume()
 
 
@@ -451,9 +503,17 @@ if __name__ == "__main__":
     # Running directly, just start ComfyUI.
     logging.info("Python version: {}".format(sys.version))
     logging.info("ComfyUI version: {}".format(comfyui_version.__version__))
+    for package in ("comfy-aimdo", "comfy-kitchen"):
+        try:
+            logging.info("{} version: {}".format(package, importlib.metadata.version(package)))
+        except:
+            pass
 
     if sys.version_info.major == 3 and sys.version_info.minor < 10:
         logging.warning("WARNING: You are using a python version older than 3.10, please upgrade to a newer one. 3.12 and above is recommended.")
+
+    if args.disable_dynamic_vram:
+        logging.warning("Dynamic vram disabled with argument. If you have any issues with dynamic vram enabled please give us a detailed reports as this argument will be removed soon.")
 
     event_loop, _, start_all_func = start_comfyui()
     try:
